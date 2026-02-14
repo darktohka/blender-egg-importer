@@ -20,6 +20,9 @@ Find the latest release of the plugin in the [Releases](https://github.com/loona
 ## Features
 - **Please see [this](https://github.com/loonaticx/blender-egg-importer/wiki/Import-Conversion-Notes) wiki page on how Egg data is converted to Blender**
 - See [this](https://github.com/loonaticx/blender-egg-importer/wiki/Supported-&-Unsupported-Features) wiki page for a list of supported & unsupported features.
+- This supports the extra fields supported by the darktohka [MAYBEE](https://github.com/darktohka/MAYBEE) fork - LODs, flags, alpha and fixed UV!
+
+**To be used with the darktohk [MAYBEE](https://github.com/darktohka/MAYBEE) fork!**
 
 ## Reporting Issues
 If you find any bugs, please open a bug report on the issue tab, and

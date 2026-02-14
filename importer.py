@@ -1237,6 +1237,68 @@ class EggGroupNode(EggNode):
             child.apply_default_pose(context, pose)
 
 
+class EggDistance:
+    """Helper to parse <Distance> inside <SwitchCondition>.
+
+    Expected EGG syntax::
+
+        <Distance> { lod_in lod_out [lod_fade] <Vertex> { x y z } }
+
+    ``lod_fade`` is optional (defaults to 0.0 when only two numbers are
+    present).  ``<Vertex>`` is also optional (defaults to 0 0 0).
+    """
+
+    def __init__(self, values):
+        if len(values) >= 3:
+            self.lod_in = parse_number(values[0])
+            self.lod_out = parse_number(values[1])
+            self.lod_fade = parse_number(values[2])
+        elif len(values) == 2:
+            self.lod_in = parse_number(values[0])
+            self.lod_out = parse_number(values[1])
+            self.lod_fade = 0.0
+        else:
+            self.lod_in = 0.0
+            self.lod_out = 0.0
+            self.lod_fade = 1.0
+        self.center = (0.0, 0.0, 0.0)
+
+    def begin_child(self, context, type, name, values):
+        if type.upper() == 'VERTEX' and len(values) >= 3:
+            self.center = (
+                parse_number(values[0]),
+                parse_number(values[1]),
+                parse_number(values[2]),
+            )
+        return None
+
+    def end_child(self, context, type, name, child):
+        pass
+
+
+class EggSwitchCondition:
+    """Helper to parse <SwitchCondition> and collect its <Distance> child."""
+
+    def __init__(self):
+        self.lod_in = 0.0
+        self.lod_out = 0.0
+        self.lod_fade = 1.0
+        self.center = (0.0, 0.0, 0.0)
+
+    def begin_child(self, context, type, name, values):
+        if type.upper() == 'DISTANCE':
+            dist = EggDistance(values)
+            return dist
+        return None
+
+    def end_child(self, context, type, name, child):
+        if isinstance(child, EggDistance):
+            self.lod_in = child.lod_in
+            self.lod_out = child.lod_out
+            self.lod_fade = child.lod_fade
+            self.center = child.center
+
+
 class EggGroup(EggGroupNode):
     def __init__(self, name, parent):
         EggGroupNode.__init__(self)
@@ -1300,6 +1362,7 @@ class EggGroup(EggGroupNode):
 
     def begin_child(self, context, type, name, values):
         orig_type = type
+        orig_type_lower = orig_type.lower()
         type = type.upper()
 
         #if type in ('SCALAR', 'CHAR*', 'BILLBOARD', 'DCS', 'DART', 'SWITCH', 'OBJECTTYPE', 'TAG', 'MODEL', 'TEXLIST', 'REF'):
@@ -1308,7 +1371,8 @@ class EggGroup(EggGroupNode):
             name = name.lower().replace('_', '-')
 
             if name in ('collide-mask', 'from-collide-mask', 'into-collide-mask', 'bin',
-                        'draw-order', 'scroll-u', 'scroll-v', 'scroll-w'):
+                        'draw-order', 'scroll-u', 'scroll-v', 'scroll-w',
+                        'portal', 'polylight', 'occluder', 'indexed', 'alpha'):
                 # YABEE recognizes these scalars as game properties.
                 self.properties[name] = values[0]
             elif name == 'blend':
@@ -1331,20 +1395,22 @@ class EggGroup(EggGroupNode):
             # i.e. "Polyset descend", "Polyset keep descend"
             # If we don't join values, then we only get the
             # first value in the array, "Polyset"
-            self.properties[orig_type] = ' '.join(values)
+            self.properties[orig_type_lower] = ' '.join(values)
 
         elif type == 'OBJECTTYPE':
             # It's not uncommon to have more than one ObjectType on an object
             # So we want to keep them in a list instead of a singular value
-            if orig_type in self.properties.keys():
-                self.properties[orig_type].append(values[0])
+            if orig_type_lower in self.properties.keys():
+                self.properties[orig_type_lower].append(values[0])
             else:
-                self.properties[orig_type] = [values[0]]
+                self.properties[orig_type_lower] = [values[0]]
 
         elif type == 'TAG':
-            # Odd, but the reference .egg parser really intentionally joins
-            # multiple values using newlines when parsing the <Tag> body.
-            self.properties[name] = '\n'.join(values)
+            tag = f'{name}:{" ".join(values)}'
+            if orig_type_lower in self.properties.keys():
+                self.properties[orig_type_lower].append(tag)
+            else:
+                self.properties[orig_type_lower] = [tag]
 
         elif type == 'TRANSFORM':
             return EggTransform()
@@ -1363,13 +1429,20 @@ class EggGroup(EggGroupNode):
             return EggTransform()
 
         elif type == 'BILLBOARD':
+            self.properties[orig_type_lower] = values[0].lower()
             self.has_billboard = (values[0].lower() != 'none')
 
         elif type == 'BILLBOARDCENTER':
             self.has_billboard_center = True
 
         elif type == "DCS":
-            self.properties[orig_type] = values[0]
+            self.properties[orig_type_lower] = values[0]
+        
+        elif type == "SWITCHCONDITION":
+            # Parse <SwitchCondition> { <Distance> { lod_in lod_out [fade] <Vertex> { x y z } } }
+            # Returns an EggSwitchCondition so that <Distance> and <Vertex>
+            # are properly parsed as nested children.
+            return EggSwitchCondition()
 
         # DCS nodes are used as locators, where the transformation data for the pivot point is important to know.
         # The ObjectType catch here isn't going to be perfect, but it attempts to assist with any user-defined
@@ -1380,6 +1453,16 @@ class EggGroup(EggGroupNode):
         return EggGroupNode.begin_child(self, context, type, name, values)
 
     def end_child(self, context, type, name, child):
+        if isinstance(child, EggSwitchCondition):
+            # Store LOD properties from the parsed SwitchCondition
+            self.properties['lod-in'] = child.lod_in
+            self.properties['lod-out'] = child.lod_out
+            self.properties['lod-fade'] = child.lod_fade
+            self.properties['lod-center-x'] = child.center[0]
+            self.properties['lod-center-y'] = child.center[1]
+            self.properties['lod-center-z'] = child.center[2]
+            return
+
         if isinstance(child, EggTransform):
             if type.upper() == 'DEFAULTPOSE':
                 self.has_default_pose = True
@@ -1679,15 +1762,16 @@ class EggGroup(EggGroupNode):
                     object.game.properties[name].value = value
             else:
                 for name, value in self.properties.items():
-                    # We can't have multiple properties with the same name "ObjectType"
+                    # We can't have multiple properties with the same name "ObjectType" or "Tag"
                     # So we need to add a delimiter
-                    if name.upper() == "OBJECTTYPE":
+                    if name.lower() in ("objecttype", "tag"):
                         index = 1
                         for v in value:
-                            bpy.context.object[name + str(index)] = v
+                            bpy.context.object[name.lower() + "_" + str(index)] = v
                             index += 1
+                            print(f'Adding property {name.lower() + str(index)} with value {v}')
                     else:
-                        bpy.context.object[name] = value
+                        bpy.context.object[name.lower()] = value
 
             if self.shape_keys:
                 # Add the basis key first.
