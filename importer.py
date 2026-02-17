@@ -11,13 +11,6 @@ from math import radians, sqrt
 
 DEFAULT_UV_NAME = "UVMap"
 
-if bpy.app.version >= (2, 80):
-    def matmul(a, b):
-        return a.__matmul__(b)
-else:
-    def matmul(a, b):
-        return a * b
-
 
 class EggContext:
 
@@ -52,7 +45,7 @@ class EggContext:
         self.inv_cs_matrix = self.y_to_z_up_mat.inverted()
 
         # Remember external references.
-        self.external_groups = {}
+        self.external_collections = {}
 
         # We remember all the Group/VertexRef entries, so we can assign them
         # in a separate pass.
@@ -145,7 +138,7 @@ class EggContext:
             self.up_vector = Vector((0, 0, 1))
             self.forward_vector = Vector((0, -1, 0))
         elif canonical == 'YUPLEFT':
-            self.cs_matrix = matmul(self.y_to_z_up_mat, self.flip_y_mat)
+            self.cs_matrix = self.y_to_z_up_mat @ self.flip_y_mat
             self.up_vector = Vector((0, 1, 0))
             self.forward_vector = Vector((0, 0, 1))
         else:
@@ -166,7 +159,7 @@ class EggContext:
         if self.coord_system == 'ZUP':
             return matrix
         else:
-            return matmul(matmul(self.inv_cs_matrix, matrix), self.cs_matrix)
+            return self.inv_cs_matrix @ matrix @ self.cs_matrix
 
     def final_report(self):
         """ Makes error messages about things that are tallied up, such as
@@ -194,7 +187,6 @@ class EggContext:
             path = os.path.join(self.search_dir, path)
             path = path.replace(os.sep + '.' + os.sep, os.sep)
             image = bpy.data.images.load(path)
-            #image.filepath = path
         else:
             try:
                 # If the user has set a backup texture path in preferences, we should check there.
@@ -238,54 +230,45 @@ class EggContext:
 
         self.group_vertex_refs.clear()
 
-    def get_external_group(self, path):
-        """ Returns the group used for an external reference. """
+    def get_external_collection(self, path):
+        """ Returns the collection used for an external reference. """
 
-        if path in self.external_groups:
-            return self.external_groups[path]
+        if path in self.external_collections:
+            return self.external_collections[path]
 
-        group = bpy.data.groups.new(path)
-        self.external_groups[path] = group
-        return group
+        collection = bpy.data.collections.new(path)
+        self.external_collections[path] = collection
+        return collection
 
     def load_external_references(self):
         """ Resolves external file references. """
 
-        if not self.external_groups:
-            pass
+        if not self.external_collections:
+            return
 
         orig_scene = bpy.context.scene
         orig_search_dir = self.search_dir
 
-        # Please note that things may be added to self.external_groups
+        # Please note that things may be added to self.external_collections
         # recursively.
 
-        for path, group in self.external_groups.items():
+        for path, collection in self.external_collections.items():
             # Create a separate scene for this model.
             scene = bpy.data.scenes.new(path)
-
-            # XXX New blender API breaks this
-            # https://blender.stackexchange.com/a/179196
-            if bpy.app.version <= (2, 79, 7):
-                bpy.context.screen.scene = scene
-            else:
-                bpy.context.window.scene = scene
+            bpy.context.window.scene = scene
 
             # Convert the external scene.
-            path = os.path.join(orig_search_dir, path)
-            self.search_dir = os.path.dirname(path)
-            root = self.read_file(path)
+            full_path = os.path.join(orig_search_dir, path)
+            self.search_dir = os.path.dirname(full_path)
+            root = self.read_file(full_path)
             root.build_tree(self)
             self.assign_vertex_groups()
 
-            # Assign all objects in the loaded scene to the group.
+            # Assign all objects in the loaded scene to the collection.
             for obj in scene.objects:
-                group.objects.link(obj)
+                collection.objects.link(obj)
 
-        if bpy.app.version <= (2, 79, 7):
-            bpy.context.screen.scene = orig_scene
-        else:
-            bpy.context.window.scene = orig_scene
+        bpy.context.window.scene = orig_scene
         self.search_dir = orig_search_dir
 
     def auto_bind(self):
@@ -402,7 +385,7 @@ class EggMaterial:
             elif name == 'ior':
                 self.ior = value
 
-    def _get_material_28(self, group, prim):
+    def get_material(self, group, prim):
         """ Returns the material for the indicated primitive. """
 
         bface = prim.bface
@@ -456,21 +439,23 @@ class EggMaterial:
         if self.ior is not None and hasattr(bmat, "ior"):
             bmat.ior = self.ior
 
-        if (group.blend_mode in ('add', 'subtract') and group.blend_operands == ['fbuffer_color', 'zero']) or \
-           (group.blend_mode in ('add', 'inv_subtract') and group.blend_operands == ['zero', 'incoming_color']):
-            bmat.blend_method = 'MULTIPLY'
-        elif group.blend_mode == 'add':
-            bmat.blend_method = 'ADD'
-        elif alpha:
-            alpha = alpha.lower()
-            if alpha == 'off':
-                bmat.blend_method = 'OPAQUE'
-            elif alpha.startswith('ms'):
-                bmat.blend_method = 'HASHED'
-            elif alpha == 'binary':
-                bmat.blend_method = 'CLIP'
-            else:
-                bmat.blend_method = 'BLEND'
+        # blend_method was removed in Blender 4.2 (EEVEE Next).
+        if hasattr(bmat, 'blend_method'):
+            if (group.blend_mode in ('add', 'subtract') and group.blend_operands == ['fbuffer_color', 'zero']) or \
+               (group.blend_mode in ('add', 'inv_subtract') and group.blend_operands == ['zero', 'incoming_color']):
+                bmat.blend_method = 'MULTIPLY'
+            elif group.blend_mode == 'add':
+                bmat.blend_method = 'ADD'
+            elif alpha:
+                alpha_lower = alpha.lower()
+                if alpha_lower == 'off':
+                    bmat.blend_method = 'OPAQUE'
+                elif alpha_lower.startswith('ms'):
+                    bmat.blend_method = 'HASHED'
+                elif alpha_lower == 'binary':
+                    bmat.blend_method = 'CLIP'
+                else:
+                    bmat.blend_method = 'BLEND'
 
         bmat.use_backface_culling = not bface
 
@@ -492,10 +477,16 @@ class EggMaterial:
             bsdf.inputs["Metallic"].default_value = bmat.metallic
             if self.ior is not None:
                 bsdf.inputs["IOR"].default_value = self.ior
-            if self.emit and bsdf.inputs.get("Emission"):
-                bsdf.inputs["Emission"].default_value = self.emit
-            if not any(self.spec[:3]) and bsdf.inputs.get("Specular"):
-                bsdf.inputs["Specular"].default_value = 0.0
+
+            # Blender 4.0+ renamed "Emission" to "Emission Color"
+            emission_input = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+            if self.emit and emission_input:
+                emission_input.default_value = self.emit
+
+            # Blender 4.0+ renamed "Specular" to "Specular IOR Level"
+            specular_input = bsdf.inputs.get("Specular IOR Level") or bsdf.inputs.get("Specular")
+            if not any(self.spec[:3]) and specular_input:
+                specular_input.default_value = 0.0
 
             color_out = bsdf.inputs['Base Color']
             alpha_out = bsdf.inputs['Alpha']
@@ -521,8 +512,8 @@ class EggMaterial:
         # Create nodes to sample and combine the various texture stages.
         for i, texture in enumerate(textures):
             tex_node = bmat.node_tree.nodes.new("ShaderNodeTexImage")
-            tex_node.image = texture.texture.image
-            tex_node.extension = texture.texture.extension
+            tex_node.image = texture.image
+            tex_node.extension = texture.extension
 
             if texture.minfilter and texture.minfilter.startswith("nearest"):
                 tex_node.interpolation = "Closest"
@@ -533,18 +524,19 @@ class EggMaterial:
                 has_alpha = True
             elif texture.format in ('red', 'green', 'blue', 'luminance', 'sluminance', 'rgb', 'rgb12', 'rgb8', 'rgb5', 'rgb332', 'srgb'):
                 has_alpha = False
-            elif texture.texture.image.channels < 4:
+            elif texture.image.channels < 4:
                 has_alpha = False
             else:
                 # Determine whether the image has an alpha channel.
                 has_alpha = False
-                for alpha in tuple(texture.texture.image.pixels)[3::4]:
-                    if alpha != 1.0:
+                for alpha_val in tuple(texture.image.pixels)[3::4]:
+                    if alpha_val != 1.0:
                         has_alpha = True
                         break
 
             if has_alpha and not want_bsdf:
-                bmat.blend_method = 'BLEND'
+                if hasattr(bmat, 'blend_method'):
+                    bmat.blend_method = 'BLEND'
 
             # Create an UVMap node, if none already exists for this UV set.
             uv_layer = texture.uv_name or "UVMap"
@@ -560,12 +552,8 @@ class EggMaterial:
             m = texture.matrix
             if m is not None:
                 map_node = bmat.node_tree.nodes.new("ShaderNodeMapping")
-                if bpy.app.version >= (2, 81):
-                    map_node.inputs['Scale'].default_value = (m[0][0], m[1][1], m[2][2])
-                    map_node.inputs['Location'].default_value = Vector((m[0][3], m[1][3], m[2][3]))
-                else:
-                    map_node.scale = (m[0][0], m[1][1], m[2][2])
-                    map_node.translation = Vector((m[0][3], m[1][3], m[2][3]))
+                map_node.inputs['Scale'].default_value = (m[0][0], m[1][1], m[2][2])
+                map_node.inputs['Location'].default_value = Vector((m[0][3], m[1][3], m[2][3]))
                 bmat.node_tree.links.new(map_node.inputs['Vector'], uv_node.outputs['UV'])
                 bmat.node_tree.links.new(tex_node.inputs['Vector'], map_node.outputs['Vector'])
             else:
@@ -588,29 +576,31 @@ class EggMaterial:
             if texture.envtype in ('add', 'decal', 'blend', 'modulate', 'modulate_glow', 'modulate_gloss'):
                 if has_color and color_out.is_linked:
                     # We already have something mapped; add a mixing node.
-                    mix_node = bmat.node_tree.nodes.new("ShaderNodeMixRGB")
-                    mix_node.inputs["Fac"].default_value = 1.0
+                    # Blender 3.4+ uses ShaderNodeMix instead of ShaderNodeMixRGB.
+                    mix_node = bmat.node_tree.nodes.new("ShaderNodeMix")
+                    mix_node.data_type = 'RGBA'
+                    mix_node.inputs[0].default_value = 1.0  # Factor
 
                     old_socket = color_out.links[0].from_socket
                     bmat.node_tree.links.remove(color_out.links[0])
-                    bmat.node_tree.links.new(old_socket, mix_node.inputs['Color1'])
+                    bmat.node_tree.links.new(old_socket, mix_node.inputs[6])  # A (Color)
 
                     if texture.envtype == 'add':
                         mix_node.blend_type = 'ADD'
-                        bmat.node_tree.links.new(color, mix_node.inputs['Color2'])
+                        bmat.node_tree.links.new(color, mix_node.inputs[7])  # B (Color)
                     elif texture.envtype == 'decal':
                         mix_node.blend_type = 'MIX'
-                        bmat.node_tree.links.new(color, mix_node.inputs['Color2'])
-                        bmat.node_tree.links.new(alpha, mix_node.inputs['Fac'])
+                        bmat.node_tree.links.new(color, mix_node.inputs[7])  # B (Color)
+                        bmat.node_tree.links.new(alpha, mix_node.inputs[0])  # Factor
                     elif texture.envtype == 'blend':
                         mix_node.blend_type = 'MIX'
-                        mix_node.inputs['Color2'].default_value = texture.color
-                        bmat.node_tree.links.new(color, mix_node.inputs['Fac'])
+                        mix_node.inputs[7].default_value = texture.color  # B (Color)
+                        bmat.node_tree.links.new(color, mix_node.inputs[0])  # Factor
                     else:
                         mix_node.blend_type = 'MULTIPLY'
-                        bmat.node_tree.links.new(color, mix_node.inputs['Color2'])
+                        bmat.node_tree.links.new(color, mix_node.inputs[7])  # B (Color)
 
-                    color = mix_node.outputs['Color']
+                    color = mix_node.outputs[2]  # Result (Color)
 
                 if has_color:
                     bmat.node_tree.links.new(color_out, color)
@@ -631,11 +621,16 @@ class EggMaterial:
                     bmat.node_tree.links.new(alpha_out, alpha)
 
             if want_bsdf:
+                # Blender 4.0+ renamed some Principled BSDF inputs.
+                specular_input = bsdf.inputs.get("Specular IOR Level") or bsdf.inputs.get("Specular")
+                emission_input = bsdf.inputs.get("Emission Color") or bsdf.inputs.get("Emission")
+
                 if texture.envtype in ('normal', 'normal_height', 'normal_gloss'):
                     bmat.node_tree.links.new(bsdf.inputs['Normal'], color)
 
                 if texture.envtype in ('gloss', 'modulate_gloss', 'normal_gloss'):
-                    bmat.node_tree.links.new(bsdf.inputs['Specular'], alpha)
+                    if specular_input:
+                        bmat.node_tree.links.new(specular_input, alpha)
 
                 if texture.envtype in ('glow', 'modulate_glow'):
                     bmat.node_tree.links.new(bsdf.inputs['Emission Strength'], alpha)
@@ -643,39 +638,43 @@ class EggMaterial:
                 if texture.envtype == 'emission':
                     # Multiply in the emission color, if we have one.
                     if self.emit and tuple(self.emit[:3]) != (1, 1, 1):
-                        mul_node = bmat.node_tree.nodes.new('ShaderNodeMixRGB')
+                        mul_node = bmat.node_tree.nodes.new('ShaderNodeMix')
+                        mul_node.data_type = 'RGBA'
                         mul_node.blend_type = 'MULTIPLY'
-                        mul_node.inputs['Fac'].default_value = 1.0
-                        mul_node.inputs['Color2'].default_value = self.emit
+                        mul_node.inputs[0].default_value = 1.0  # Factor
+                        mul_node.inputs[7].default_value = self.emit  # B (Color)
 
-                        bmat.node_tree.links.new(mul_node.inputs['Color1'], color)
-                        bmat.node_tree.links.new(bsdf.inputs['Emission'], mul_node.outputs[0])
+                        bmat.node_tree.links.new(mul_node.inputs[6], color)  # A (Color)
+                        if emission_input:
+                            bmat.node_tree.links.new(emission_input, mul_node.outputs[2])  # Result
                     else:
-                        bmat.node_tree.links.new(bsdf.inputs['Emission'], mul_node.outputs[0])
+                        if emission_input:
+                            bmat.node_tree.links.new(emission_input, color)
 
                 if texture.envtype == 'selector' and \
                    (bmat.metallic != 0.0 or bmat.roughness is None or bmat.roughness != 0.0):
                     # This slot is, by convention, used for metallic-roughness.
-                    sep_node = bmat.node_tree.nodes.new('ShaderNodeSeparateRGB')
+                    # Blender 3.5+ uses ShaderNodeSeparateColor.
+                    sep_node = bmat.node_tree.nodes.new('ShaderNodeSeparateColor')
                     bmat.node_tree.links.new(sep_node.inputs[0], color)
 
                     if bmat.metallic != 1.0:
                         mul_node = bmat.node_tree.nodes.new("ShaderNodeMath")
                         mul_node.operation = 'MULTIPLY'
                         mul_node.inputs[1].default_value = bmat.metallic
-                        bmat.node_tree.links.new(mul_node.inputs[0], sep_node.outputs['B'])
+                        bmat.node_tree.links.new(mul_node.inputs[0], sep_node.outputs['Blue'])
                         bmat.node_tree.links.new(bsdf.inputs['Metallic'], mul_node.outputs[0])
                     else:
-                        bmat.node_tree.links.new(bsdf.inputs['Metallic'], sep_node.outputs['B'])
+                        bmat.node_tree.links.new(bsdf.inputs['Metallic'], sep_node.outputs['Blue'])
 
                     if bmat.roughness is not None and bmat.roughness != 1.0:
                         mul_node = bmat.node_tree.nodes.new("ShaderNodeMath")
                         mul_node.operation = 'MULTIPLY'
                         mul_node.inputs[1].default_value = bmat.roughness
-                        bmat.node_tree.links.new(mul_node.inputs[0], sep_node.outputs['G'])
+                        bmat.node_tree.links.new(mul_node.inputs[0], sep_node.outputs['Green'])
                         bmat.node_tree.links.new(bsdf.inputs['Roughness'], mul_node.outputs[0])
                     else:
-                        bmat.node_tree.links.new(bsdf.inputs['Roughness'], sep_node.outputs['G'])
+                        bmat.node_tree.links.new(bsdf.inputs['Roughness'], sep_node.outputs['Green'])
 
         # Assign each node to a column.  The method below ensures that
         # connections always flow from left to right, never right to left.
@@ -723,111 +722,12 @@ class EggMaterial:
 
             node.location = (x, -300.0 * (row - 1))
 
-    def _get_material_27(self, group, prim):
-        """ Returns the material for the indicated primitive. """
-
-        if group.have_vertex_colors:
-            flat_color = None
-        else:
-            flat_color = prim.color or (1, 1, 1, 1)
-
-        bface = prim.bface
-        textures = prim.textures
-        alpha = prim.alpha_mode
-
-        if len(textures) == 0 and self is EggPrimitive.default_material and not bface and not alpha:
-            return None
-
-        key = (tuple(textures), flat_color, bface, alpha)
-        if key in self.materials:
-            return self.materials[key]
-
-        bmat = bpy.data.materials.new(self.name)
-        bmat.diffuse_intensity = 1.0
-        bmat.specular_intensity = 1.0
-        bmat.specular_hardness = self.shininess * 2
-
-        if not any(self.spec) and self.diff and not any(self.diff) and not any(self.amb):
-            # This is YABEE's way of making a shadeless material.
-            bmat.use_shadeless = True
-            bmat.diffuse_color = self.emit[:3]
-        else:
-            if self.diff:
-                bmat.diffuse_color = self.diff[:3]
-            elif flat_color:
-                bmat.diffuse_color = flat_color[:3]
-            else:
-                bmat.diffuse_color = [1, 1, 1]
-            bmat.specular_color = self.spec[:3]
-            bmat.specular_alpha = self.spec[3]
-
-            # Blender only supports one ambient value, so we average it.
-            bmat.ambient = (self.amb[0] + self.amb[1] + self.amb[2]) / 3
-
-            # Same for emission, except that it specifes the emission as a product
-            # of the diffuse color, so we have to divide it.
-            if any(bmat.diffuse_color):
-                bmat.emit = sum(self.emit[:3]) / sum(bmat.diffuse_color)
-
-        if group.blend_mode and group.blend_mode == 'add':
-            bmat.game_settings.alpha_blend = 'ADD'
-        elif alpha:
-            alpha = alpha.lower()
-            if alpha == 'off':
-                bmat.game_settings.alpha_blend = 'OPAQUE'
-            elif alpha.startswith('ms'):
-                bmat.game_settings.alpha_blend = 'ALPHA_ANTIALIASING'
-            elif alpha == 'binary':
-                bmat.game_settings.alpha_blend = 'CLIP'
-            else:
-                bmat.game_settings.alpha_blend = 'ALPHA'
-
-        bmat.game_settings.use_backface_culling = not bface
-
-        for i, texture in enumerate(textures):
-            slot = bmat.texture_slots.add()
-            slot.texture = texture.texture
-            slot.uv_layer = texture.uv_name or "UVMap"
-
-            # Convert the Panda texture transform to the equivalent Blender
-            # transform.  Ignores rotation, shear, or axis remap.
-            m = texture.matrix
-            if m is not None:
-                pos = Vector((m[0][3], m[1][3], m[2][3]))
-                slot.scale = (m[0][0], m[1][1], m[2][2])
-                slot.offset = pos + (slot.scale - Vector((1, 1, 1))) * 0.5
-
-            if texture.envtype == 'modulate':
-                slot.use_map_color_diffuse = True
-            elif texture.envtype == 'normal':
-                slot.use_map_color_diffuse = False
-                slot.use_map_normal = True
-            elif texture.envtype == 'glow':
-                slot.use_map_color_diffuse = True
-                slot.use_map_emit = True
-            elif texture.envtype == 'gloss':
-                slot.use_map_color_diffuse = True
-                slot.use_map_specular = True
-
-            # Should probably be more sophisticated; right now this is to
-            # support what YABEE generates.
-            if texture.blend == 'add' and not alpha:
-                bmat.game_settings.alpha_blend = 'ADD'
-
-        self.materials[key] = bmat
-        return bmat
-
-    if bpy.app.version >= (2, 80):
-        get_material = _get_material_28
-    else:
-        get_material = _get_material_27
-
 
 class EggTexture:
     def __init__(self, name, image):
-        self.texture = bpy.data.textures.new(name, 'IMAGE')
         self.name = name
-        self.texture.image = image
+        self.image = image
+        self.extension = 'REPEAT'
         self.format = None
         self.envtype = 'modulate'
         self.uv_name = None
@@ -848,11 +748,11 @@ class EggTexture:
             if name == 'wrap':
                 value = values[0].lower()
                 if value == 'repeat':
-                    self.texture.extension = 'REPEAT'
+                    self.extension = 'REPEAT'
                 elif value == 'clamp':
-                    self.texture.extension = 'EXTEND'
+                    self.extension = 'EXTEND'
                 elif value in ('border_color', 'border-color'):
-                    self.texture.extension = 'CLIP'
+                    self.extension = 'CLIP'
 
             elif name == 'format':
                 self.format = values[0].lower().replace('-', '_')
@@ -860,17 +760,14 @@ class EggTexture:
             elif name == 'envtype':
                 self.envtype = values[0].lower().replace('-', '_')
                 if self.envtype in ('normal', 'normal_height', 'normal_gloss'):
-                    self.texture.use_normal_map = True
-                    self.texture.image.colorspace_settings.name = 'Non-Color'
+                    self.image.colorspace_settings.name = 'Non-Color'
 
             elif name == 'minfilter':
                 self.minfilter = values[0].lower()
-                if 'mipmap' in self.minfilter:
-                    self.texture.use_mipmap = True
 
             elif name == 'alpha':
                 if values[0].lower() == 'premultiplied':
-                    self.texture.image.alpha_mode = 'PREMUL'
+                    self.image.alpha_mode = 'PREMUL'
 
             elif name == 'blend':
                 self.blend = values[0].lower()
@@ -896,7 +793,7 @@ class EggTexture:
     def end_child(self, context, type, name, child):
         if isinstance(child, EggTransform):
             if self.matrix is not None:
-                self.matrix = matmul(self.matrix, child.matrix)
+                self.matrix = self.matrix @ child.matrix
             else:
                 self.matrix = child.matrix
 
@@ -913,21 +810,21 @@ class EggTransform:
         type = type.upper()
         if type == 'TRANSLATE':
             if len(values) == 2:
-                self.matrix = matmul(Matrix.Translation(v + [0]), self.matrix)
+                self.matrix = Matrix.Translation(v + [0]) @ self.matrix
             else:
-                self.matrix = matmul(Matrix.Translation(v), self.matrix)
+                self.matrix = Matrix.Translation(v) @ self.matrix
 
         elif type == 'ROTATE':
-            self.matrix = matmul(Matrix.Rotation(radians(v[0]), 4, v[1:] or (0, 0, 1)), self.matrix)
+            self.matrix = Matrix.Rotation(radians(v[0]), 4, v[1:] or (0, 0, 1)) @ self.matrix
 
         elif type == 'ROTX':
-            self.matrix = matmul(Matrix.Rotation(radians(v[0]), 4, 'X'), self.matrix)
+            self.matrix = Matrix.Rotation(radians(v[0]), 4, 'X') @ self.matrix
 
         elif type == 'ROTY':
-            self.matrix = matmul(Matrix.Rotation(radians(v[0]), 4, 'Y'), self.matrix)
+            self.matrix = Matrix.Rotation(radians(v[0]), 4, 'Y') @ self.matrix
 
         elif type == 'ROTZ':
-            self.matrix = matmul(Matrix.Rotation(radians(v[0]), 4, 'Z'), self.matrix)
+            self.matrix = Matrix.Rotation(radians(v[0]), 4, 'Z') @ self.matrix
 
         elif type == 'SCALE':
             if len(v) == 1:
@@ -937,21 +834,19 @@ class EggTransform:
                 z = 1
             else:
                 x, y, z = v
-            self.matrix = matmul(Matrix(((x, 0, 0, 0), (0, y, 0, 0), (0, 0, z, 0), (0, 0, 0, 1))), self.matrix)
+            self.matrix = Matrix(((x, 0, 0, 0), (0, y, 0, 0), (0, 0, z, 0), (0, 0, 0, 1))) @ self.matrix
 
         elif type == 'MATRIX3':
-            self.matrix = matmul(
-                Matrix(((v[0], v[3],  0.0, v[6]),
+            self.matrix = Matrix(((v[0], v[3],  0.0, v[6]),
                         (v[1], v[4],  0.0, v[7]),
                         ( 0.0,  0.0,  1.0,  0.0),
-                        (v[2], v[5],  0.0, v[8]))), self.matrix)
+                        (v[2], v[5],  0.0, v[8]))) @ self.matrix
 
         elif type == 'MATRIX4':
-            self.matrix = matmul(
-                Matrix(((v[0], v[4], v[8], v[12]),
+            self.matrix = Matrix(((v[0], v[4], v[8], v[12]),
                         (v[1], v[5], v[9], v[13]),
                         (v[2], v[6], v[10], v[14]),
-                        (v[3], v[7], v[11], v[15]))), self.matrix)
+                        (v[3], v[7], v[11], v[15]))) @ self.matrix
 
 
 class EggVertex:
@@ -1365,8 +1260,6 @@ class EggGroup(EggGroupNode):
         orig_type_lower = orig_type.lower()
         type = type.upper()
 
-        #if type in ('SCALAR', 'CHAR*', 'BILLBOARD', 'DCS', 'DART', 'SWITCH', 'OBJECTTYPE', 'TAG', 'MODEL', 'TEXLIST', 'REF'):
-
         if type in ('SCALAR', 'CHAR*'):
             name = name.lower().replace('_', '-')
 
@@ -1437,7 +1330,7 @@ class EggGroup(EggGroupNode):
 
         elif type == "DCS":
             self.properties[orig_type_lower] = values[0]
-        
+
         elif type == "SWITCHCONDITION":
             # Parse <SwitchCondition> { <Distance> { lod_in lod_out [fade] <Vertex> { x y z } } }
             # Returns an EggSwitchCondition so that <Distance> and <Vertex>
@@ -1472,7 +1365,7 @@ class EggGroup(EggGroupNode):
                     self.default_pose = child.matrix
             else:
                 if self.matrix is not None:
-                    self.matrix = matmul(self.matrix, child.matrix)
+                    self.matrix = self.matrix @ child.matrix
                 else:
                     self.matrix = child.matrix
 
@@ -1555,53 +1448,20 @@ class EggGroup(EggGroupNode):
             else:
                 self.normals.append(vertex_normal or poly_normal)
 
-            if bpy.app.version >= (2, 79, 7):
-                if vertex.color:
-                    self.have_vertex_colors = True
-                    self.vertex_colors += vertex.color
-                else:
-                    self.vertex_colors += (1, 1, 1, 1)
+            if vertex.color:
+                self.have_vertex_colors = True
+                self.vertex_colors += vertex.color
             else:
-                if vertex.color:
-                    self.have_vertex_colors = True
-                    self.vertex_colors += vertex.color[:3]
-                else:
-                    self.vertex_colors += (1, 1, 1)
+                self.vertex_colors += (1, 1, 1, 1)
 
             for name, uv in vertex.uv_map.items():
                 if name not in mesh.uv_layers:
-                    if bpy.app.version >= (2, 80):
-                        mesh.uv_layers.new(name=name)
-                    else:
-                        mesh.uv_textures.new(name)
+                    mesh.uv_layers.new(name=name)
                 mesh.uv_layers[name].data[loop.index].uv = uv
 
         # Reference those loops in the polygon.
         poly.loop_start = loop_offset
-        # Newer versions of Blender have changed loop_total to be readonly, resulting in a crash.
-        if bpy.app.version < (3, 6):
-            poly.loop_total = len(prim.indices)
-
-        # Assign the highest priority texture that uses a given UV set to
-        # the UV texture.  If there are multiple textures with the same
-        # priority, use the first one.
-        if bpy.app.version < (2, 80):
-            set_textures = {}
-            for texture in prim.textures:
-                uv_name = texture.uv_name or DEFAULT_UV_NAME
-                try:
-                    uv_texture = mesh.uv_textures[uv_name]
-                except KeyError:
-                    # Display a warning.  Since this will probably be the case
-                    # for every polygon in this mesh, display it only once.
-                    if vpool.name not in texture.warned_vpools:
-                        texture.warned_vpools.add(vpool.name)
-                        context.warn("Texture {} references UV set {} which is not present on any vertex in {}".format(texture.texture.name, texture.uv_name, self.name))
-                    continue
-
-                if uv_name not in set_textures or texture.priority > set_textures[uv_name].priority:
-                    set_textures[uv_name] = texture
-                    uv_texture.data[poly_index].image = texture.texture.image
+        # loop_total is read-only in Blender 3.6+
 
         # Check if we already have a material for this combination.
         bmat = prim.material.get_material(self, prim)
@@ -1640,19 +1500,10 @@ class EggGroup(EggGroupNode):
         self.mesh_object = None
         if self.mesh:
             data = self.mesh
-            if bpy.app.version >= (2, 81):
-                data.update(calc_edges=True)
-            elif bpy.app.version >= (2, 80):
-                data.update(calc_edges=True, calc_loop_triangles=True)
-            else:
-                data.update(calc_edges=True, calc_tessface=True)
+            data.update(calc_edges=True)
 
             if self.have_normals:
                 # Check if the mesh just uses smooth normals. If so, don't bother importing custom normals.
-                # NB: calc_normals has been deprecated in blender 4.0
-                # https://projects.blender.org/blender/blender/commit/ab5fc46872b9960b5bb50d98147bea0d677028b9
-                if hasattr(data, "calc_normals"):
-                    data.calc_normals()
                 max_diff = 0
                 for normal1, l in zip(self.normals, data.loops):
                     normal2 = data.vertices[l.vertex_index].normal
@@ -1661,11 +1512,10 @@ class EggGroup(EggGroupNode):
 
                 if max_diff > 0.01:
                     data.normals_split_custom_set(self.normals)
-                    if bpy.app.version <= (4, 0):
-                        data.use_auto_smooth = True
 
             if self.have_vertex_colors:
-                cols = data.vertex_colors.new()
+                # Use color_attributes API (Blender 3.2+) instead of deprecated vertex_colors
+                cols = data.color_attributes.new(name="Col", type='FLOAT_COLOR', domain='CORNER')
                 cols.data.foreach_set('color', self.vertex_colors)
 
             if data.validate(verbose=True):
@@ -1705,8 +1555,8 @@ class EggGroup(EggGroupNode):
             if instance.matrix and not self.matrix and not self.children and data is None:
                 # We can safely copy the matrix from the child.
                 self.matrix = instance.matrix
-            object.dupli_type = 'GROUP'
-            object.dupli_group = context.get_external_group(file)
+            object.instance_type = 'COLLECTION'
+            object.instance_collection = context.get_external_collection(file)
 
         if not inv_matrix:
             inv_matrix = context.inv_cs_matrix
@@ -1716,7 +1566,7 @@ class EggGroup(EggGroupNode):
             matrix = context.transform_matrix(self.matrix)
             object.matrix_basis = matrix
 
-            inv_matrix = matmul(matrix.inverted(), inv_matrix)
+            inv_matrix = matrix.inverted() @ inv_matrix
 
         if self.is_instance_type():
             inv_matrix = context.inv_cs_matrix
@@ -1726,13 +1576,8 @@ class EggGroup(EggGroupNode):
         if inv_matrix and object.type == 'MESH':
             object.data.transform(inv_matrix)
 
-        # Place it in the scene.  We need to do this before assigning game
-        # properties, below.
-        if bpy.app.version >= (2, 80):
-            scene_objects = bpy.context.scene.collection.objects
-        else:
-            scene_objects = bpy.context.scene.objects
-
+        # Place it in the scene.
+        scene_objects = bpy.context.scene.collection.objects
         scene_objects.link(object)
 
         if self.mesh_object and object is not self.mesh_object:
@@ -1746,32 +1591,21 @@ class EggGroup(EggGroupNode):
         # Awkward, but it seems there's no other way to set a game property
         # or create bones or add shape keys.
         if self.properties or self.dart or self.shape_keys:
-            if bpy.app.version >= (2, 80):
-                active = bpy.context.view_layer.objects.active
-                bpy.context.view_layer.objects.active = object
-            else:
-                active = bpy.context.scene.objects.active
-                bpy.context.scene.objects.active = object
+            active = bpy.context.view_layer.objects.active
+            bpy.context.view_layer.objects.active = object
 
-            # Assign properties <Name> { value }
-            # Note: currently most feasible with <ObjectType> attributes
-            if bpy.app.version < (2, 80):
-                # 2.7 and below
-                for name, value in self.properties.items():
-                    bpy.ops.object.game_property_new(type='STRING', name=name)
-                    object.game.properties[name].value = value
-            else:
-                for name, value in self.properties.items():
-                    # We can't have multiple properties with the same name "ObjectType" or "Tag"
-                    # So we need to add a delimiter
-                    if name.lower() in ("objecttype", "tag"):
-                        index = 1
-                        for v in value:
-                            bpy.context.object[name.lower() + "_" + str(index)] = v
-                            index += 1
-                            print(f'Adding property {name.lower() + str(index)} with value {v}')
-                    else:
-                        bpy.context.object[name.lower()] = value
+            # Assign properties as custom properties.
+            for name, value in self.properties.items():
+                # We can't have multiple properties with the same name "ObjectType" or "Tag"
+                # So we need to add a delimiter
+                if name.lower() in ("objecttype", "tag"):
+                    index = 1
+                    for v in value:
+                        bpy.context.object[name.lower() + "_" + str(index)] = v
+                        index += 1
+                        print(f'Adding property {name.lower() + str(index)} with value {v}')
+                else:
+                    bpy.context.object[name.lower()] = value
 
             if self.shape_keys:
                 # Add the basis key first.
@@ -1792,7 +1626,6 @@ class EggGroup(EggGroupNode):
                             data[index].co = basis_data[index].co + Vector(dxyz)
 
             if self.dart and not under_dart:
-                #bpy.context.scene.update()
                 bpy.ops.object.mode_set(mode='EDIT')
                 self.build_armature(context, object, None, Matrix())
                 bpy.ops.object.mode_set(mode='OBJECT')
@@ -1802,13 +1635,10 @@ class EggGroup(EggGroupNode):
                 if self.has_default_pose:
                     self.apply_default_pose(context, object.pose)
 
-            if bpy.app.version >= (2, 80):
-                bpy.context.view_layer.objects.active = active
-                # Check to see if this node is an empty. If it is, use a 3-axis display for enhanced visibility
-                if object.type == "EMPTY":
-                    object.empty_display_type = self.empty_display_type
-            else:
-                bpy.context.scene.objects.active = active
+            bpy.context.view_layer.objects.active = active
+            # Check to see if this node is an empty. If it is, use a 3-axis display for enhanced visibility
+            if object.type == "EMPTY":
+                object.empty_display_type = self.empty_display_type
 
             if any(v in self.properties.keys() for v in ('scroll-u', 'scroll-v')):
                 modifier = self.mesh_object.modifiers.new('UVWarp', type='UV_WARP')
@@ -1833,10 +1663,7 @@ class EggGroup(EggGroupNode):
                 add_uv_driver(self.mesh_object, modifier, 0, 'scroll-u')
                 add_uv_driver(self.mesh_object, modifier, 1, 'scroll-v')
 
-        if bpy.app.version >= (2, 80):
-            object.select_set(True)
-        else:
-            object.select = True
+        object.select_set(True)
 
         return object
 
@@ -1863,7 +1690,7 @@ class EggJoint(EggGroup):
         This requires the armature to be active and in edit mode. """
 
         if self.matrix:
-            matrix = matmul(matrix, context.transform_matrix(self.matrix))
+            matrix = matrix @ context.transform_matrix(self.matrix)
 
         # Blender has a concept of "bone length", but Panda does not.  This
         # means we have to guess the bone length if we want sightly armatures.
@@ -1951,7 +1778,7 @@ class EggJoint(EggGroup):
 
         pose_bone = pose.bones[self.bone_name]
         if pose_bone.parent:
-            matrix = matmul(pose_bone.parent.matrix, matrix)
+            matrix = pose_bone.parent.matrix @ matrix
         pose_bone.matrix = matrix
 
         EggGroupNode.apply_default_pose(self, context, pose)
@@ -2085,39 +1912,38 @@ class EggBundle(EggTable):
                 chan_y = channels['j']
                 chan_z = channels['k']
                 for i in range(num_frames):
-                    matrices[i] = matmul(
-                        Matrix(((chan_x[i], 0, 0, 0),
+                    matrices[i] = Matrix(((chan_x[i], 0, 0, 0),
                                 (0, chan_y[i], 0, 0),
                                 (0, 0, chan_z[i], 0),
-                                (0, 0, 0, 1))), matrices[i])
+                                (0, 0, 0, 1))) @ matrices[i]
 
             elif o == 'h' and 'h' in channels:
                 for i, h in enumerate(channels['h']):
-                    matrices[i] = matmul(Matrix.Rotation(radians(h), 4, context.up_vector), matrices[i])
+                    matrices[i] = Matrix.Rotation(radians(h), 4, context.up_vector) @ matrices[i]
 
             elif o == 'p' and 'p' in channels:
                 for i, p in enumerate(channels['p']):
-                    matrices[i] = matmul(Matrix.Rotation(radians(p), 4, context.right_vector), matrices[i])
+                    matrices[i] = Matrix.Rotation(radians(p), 4, context.right_vector) @ matrices[i]
 
             elif o == 'r' and 'r' in channels:
                 if data.order == 'sphrt':
                     for i, r in enumerate(channels['r']):
-                        matrices[i] = matmul(Matrix.Rotation(radians(-r), 4, context.forward_vector), matrices[i])
+                        matrices[i] = Matrix.Rotation(radians(-r), 4, context.forward_vector) @ matrices[i]
                 else:
                     for i, r in enumerate(channels['r']):
-                        matrices[i] = matmul(Matrix.Rotation(radians(r), 4, context.forward_vector), matrices[i])
+                        matrices[i] = Matrix.Rotation(radians(r), 4, context.forward_vector) @ matrices[i]
 
             elif o == 't' and 'x' in channels and 'y' in channels and 'z' in channels:
                 chan_x = channels['x']
                 chan_y = channels['y']
                 chan_z = channels['z']
                 for i, v in enumerate(zip(chan_x, chan_y, chan_z)):
-                    matrices[i] = matmul(Matrix.Translation(v), matrices[i])
+                    matrices[i] = Matrix.Translation(v) @ matrices[i]
 
         # Multiply out the joint transform.
         if joint_matrix:
             for i, m in enumerate(matrices):
-                matrices[i] = context.transform_matrix(matmul(joint_matrix.inverted(), m))
+                matrices[i] = context.transform_matrix(joint_matrix.inverted() @ m)
         else:
             for i, m in enumerate(matrices):
                 matrices[i] = context.transform_matrix(m)
